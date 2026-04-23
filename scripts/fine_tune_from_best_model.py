@@ -77,7 +77,7 @@ def main():
 
     train_path = Path(rf"e:\Z2455862L\Desktop\Random_Programming\mitral_valve_det\mitral_valve_detector\data\processed_cone_dataset_prop_aSaco\split_augmented_3_5\reduced_labels\2_labels\train_7k_superduperreduced.csv")
     val_path   = Path(rf"e:\Z2455862L\Desktop\Random_Programming\mitral_valve_det\mitral_valve_detector\data\processed_cone_dataset_prop_aSaco\split_augmented_3_5\reduced_labels\2_labels\original_val_superduperreduced.csv")
-    #val2_path = Path(rf"E:\Z2455862L\Desktop\Random_Programming\mitral_valve_det\mitral_valve_detector\data\processed_cone_dataset_prop_aSaco\split_augmented_3_5\reduced_labels\2_labels\val_7k_superreduced.csv")
+    val2_path = Path(rf"E:\Z2455862L\Desktop\Random_Programming\mitral_valve_det\mitral_valve_detector\data\processed_cone_dataset_prop_aSaco\split_augmented_3_5\reduced_labels\2_labels\val_7k_superreduced.csv")
 
     if not train_path.exists():
         print(f"[INFO] Creating Train and Val split")
@@ -89,26 +89,35 @@ def main():
         print(f"[INFO] Train and Val splits already exist. Loading from disk.")
         train_annotations = pd.read_csv(train_path)
         val_annotations   = pd.read_csv(val_path)
-        #val2_annotations = pd.read_csv(val2_path)
+        val2_annotations = pd.read_csv(val2_path)
 
     # For debugging
-    #train_annotations = train_annotations.sample(frac=0.1, random_state=42).reset_index(drop=True)
-    #val_annotations = val_annotations.sample(frac=0.1, random_state=42).reset_index(drop=True) 
-    print(f"[DEBUG]Train samples: {len(train_annotations)}, Val samples: {len(val_annotations)}")
+    #train_annotations = train_annotations.sample(frac=0.05, random_state=42).reset_index(drop=True)
+    #val_annotations = val_annotations.sample(frac=0.08, random_state=42).reset_index(drop=True) 
+    # print(f"[DEBUG]Train samples: {len(train_annotations)}, Val samples: {len(val_annotations)}")
 
     train_dataset = EchoDataset(train_annotations, dataset_root, get_train_transforms()) # dataset object
     val_dataset   = EchoDataset(val_annotations, dataset_root, get_val_transforms())
-    #val2_dataset  = EchoDataset(val2_annotations, dataset_root, get_val_transforms())
+    val2_dataset  = EchoDataset(val2_annotations, dataset_root, get_val_transforms())
 
     train_loader = build_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader   = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    #val2_loader  = build_dataloader(val2_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    val2_loader  = build_dataloader(val2_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # =========================
     # MODEL
     # =========================
     model = build_faster_rcnn_model(num_classes=3) # 2 classes + background 
     model.to(device)
+
+    # Load best model
+    checkpoint = torch.load(rf"e:\Z2455862L\Desktop\Random_Programming\mitral_valve_det\mitral_valve_detector\experiments_after_vacations\sgd_lr0.01_bs4_cosine_3classes_3warmup_7constant_cosine_160426_nonstop\checkpoints\best_match_precision.pth")
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Freeze backbone layers
+    for name, param in model.named_parameters():
+        if "backbone" in name: # Freeze feature extractor
+            param.requires_grad = False
 
     params = [p for p in model.parameters() if p.requires_grad]
 
@@ -124,10 +133,12 @@ def main():
             nesterov=True
         )
     elif args.optimizer == "adamw":
+        params = [p for p in model.parameters() if p.requires_grad]
+
         optimizer = torch.optim.AdamW(
             params,
-            lr=args.lr,
-            weight_decay=0.0005
+            lr=1e-4, # Low learning rate
+            weight_decay=1e-4
         )
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
@@ -157,11 +168,20 @@ def main():
             schedulers=[warmup_scheduler, cosine_scheduler],
             milestones=[warmup_epochs]
         )
+
+    elif args.scheduler == "finetune_cosine":
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=5,        # short finetune
+            eta_min=1e-6    # very low floor
+        )
+
     # warmup + constant + cosine
-    if args.scheduler == "warmup_constant_cosine":
+    elif args.scheduler == "warmup_constant_cosine":
 
         warmup_epochs = 3
-        hold_epochs = 15  
+        hold_epochs = 7  
 
         # -------------------------
         # 1. Warmup
@@ -243,7 +263,7 @@ def main():
     # =========================
 
     total_start_time = time.time()  # (total training time)
-    epochs = 30
+    epochs = 5 # short fine tunning
     for epoch in range(epochs):
 
         print(f"\n===== Epoch {epoch} =====\n")
@@ -255,11 +275,11 @@ def main():
 
         # --- VALIDATION LOSS ---
         val_metrics = evaluate_detector(model, val_loader, device)
-        #val2_metrics = evaluate_detector(model, val2_loader, device)
+        val2_metrics = evaluate_detector(model, val2_loader, device)
 
         # --- METRICS ---
         val_metric_results = evaluate_metrics(model, val_loader, device)
-        #val2_metric_results = evaluate_metrics(model, val2_loader, device)
+        val2_metric_results = evaluate_metrics(model, val2_loader, device)
 
         train_metric_results = evaluate_metrics(
             model, train_loader, device, max_batches=10
@@ -270,20 +290,20 @@ def main():
         # =========================
         writer.add_scalars("loss", {
             "train": train_metrics["loss"],                  # training loss
-            "val": val_metrics["total_loss"]                # original val loss
-            #"val2": val2_metrics["total_loss"]               # NEW second val loss
+            "val": val_metrics["total_loss"],                # original val loss
+            "val2": val2_metrics["total_loss"]               # NEW second val loss
         }, epoch)
 
         writer.add_scalars("match_precision", {
             "train": train_metric_results["avg_match_precision"],   # train MP
-            "val": val_metric_results["avg_match_precision"]       # val MP
-            #"val2": val2_metric_results["avg_match_precision"]      # NEW val2 MP
+            "val": val_metric_results["avg_match_precision"],       # val MP
+            "val2": val2_metric_results["avg_match_precision"]      # NEW val2 MP
         }, epoch)
 
         writer.add_scalars("label_precision", {
             "train": train_metric_results["avg_label_precision"],   # train LP
-            "val": val_metric_results["avg_label_precision"]       # val LP
-            #"val2": val2_metric_results["avg_label_precision"]      # NEW val2 LP
+            "val": val_metric_results["avg_label_precision"],       # val LP
+            "val2": val2_metric_results["avg_label_precision"]      # NEW val2 LP
         }, epoch)
 
         # =========================
@@ -297,11 +317,11 @@ def main():
         print(f"[INFO] Current Metrics at epoch {epoch}:")
         print(f"       Train Loss: {current_train_loss:.4f}")
         print(f"       Val Loss: {current_val_loss:.4f}")
-        #print(f"       Val2 Loss: {val2_metrics['total_loss']:.4f}")           # val2 loss
+        print(f"       Val2 Loss: {val2_metrics['total_loss']:.4f}")           # val2 loss
         print(f"       Match Precision: {current_match:.4f}")
         print(f"       Label Precision: {current_label:.4f}")
-        #print(f"       Val2 Match Precision: {val2_metric_results['avg_match_precision']:.4f}")  # val2 MP
-        #print(f"       Val2 Label Precision: {val2_metric_results['avg_label_precision']:.4f}")  # val2 LP
+        print(f"       Val2 Match Precision: {val2_metric_results['avg_match_precision']:.4f}")  # val2 MP
+        print(f"       Val2 Label Precision: {val2_metric_results['avg_label_precision']:.4f}")  # val2 LP
 
         # =========================
         # INDEPENDENT MODEL SELECTION
