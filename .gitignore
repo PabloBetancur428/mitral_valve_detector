@@ -29,8 +29,6 @@ model_epoch_best.pth
 *.pth
 *.zip
 croped*
-inference*
-!inference.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
